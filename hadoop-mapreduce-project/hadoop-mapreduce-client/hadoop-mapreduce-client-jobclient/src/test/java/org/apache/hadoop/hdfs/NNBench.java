@@ -26,10 +26,18 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.PrintStream;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Date;
 import java.util.Iterator;
+import java.util.List;
 import java.util.StringTokenizer;
 
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import org.apache.hadoop.HadoopIllegalArgumentException;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.conf.Configured;
@@ -86,7 +94,7 @@ public class NNBench extends Configured implements Tool {
   static final String DEFAULT_RES_FILE_NAME = "NNBench_results.log";
   private static final String NNBENCH_VERSION = "NameNode Benchmark 0.4";
 
-  private String operation = "none";
+  private String operations = "none";
   private long numberOfMaps = 1l; // default is 1
   private long numberOfReduces = 1l; // default is 1
   private long startTime =
@@ -95,9 +103,11 @@ public class NNBench extends Configured implements Tool {
   private int bytesToWrite = 0; // default is 0
   private long bytesPerChecksum = 1l; // default is 1
   private long numberOfFiles = 1l; // default is 1
+  private int numberOfThreads = 1; // default is 1
   private short replicationFactorPerFile = 1; // default is 1
   private String baseDir = "/benchmarks/NNBench";  // default
   private boolean readFileAfterOpen = false; // default is to not read
+  private boolean disableFsCache = false;
   private boolean isHelpMessage = false;
   // Supported operations
   private static final String OP_CREATE_WRITE = "create_write";
@@ -120,9 +130,12 @@ public class NNBench extends Configured implements Tool {
     FileSystem tempFS = FileSystem.get(getConf());
     
     // Delete the data directory only if it is the create/write operation
-    if (operation.equals(OP_CREATE_WRITE)) {
-      LOG.info("Deleting data directory");
-      tempFS.delete(new Path(baseDir, DATA_DIR_NAME), true);
+    String[] operationArr = operations.split(",");
+    for (String operation : operationArr) {
+      if (operation.equals(OP_CREATE_WRITE)) {
+        LOG.info("Deleting data directory");
+        tempFS.delete(new Path(baseDir, DATA_DIR_NAME), true);
+      }
     }
     tempFS.delete(new Path(baseDir, CONTROL_DIR_NAME), true);
     tempFS.delete(new Path(baseDir, OUTPUT_DIR_NAME), true);
@@ -169,8 +182,8 @@ public class NNBench extends Configured implements Tool {
     String usage =
       "Usage: nnbench <options>\n" +
       "Options:\n" +
-      "\t-operation <Available operations are " + OP_CREATE_WRITE + " " +
-      OP_OPEN_READ + " " + OP_RENAME + " " + OP_DELETE + ". " +
+      "\t-operations <Available operations are " + OP_CREATE_WRITE + " " +
+      OP_OPEN_READ + " " + OP_RENAME + " " + OP_DELETE + ". use ',' join multiple operations" +
       "This option is mandatory>\n" +
       "\t * NOTE: The open_read, rename and delete operations assume " +
       "that the files they operate on, are already available. " +
@@ -190,6 +203,8 @@ public class NNBench extends Configured implements Tool {
       "This is not mandatory>\n" +
       "\t-numberOfFiles <number of files to create. default is 1. " +
       "This is not mandatory>\n" +
+      "\t-numberOfThreads <number of threads in each mapper, default is 1." +
+      "This is not mandatory>\n" +
       "\t-replicationFactorPerFile <Replication factor for the files." +
         " default is 1. This is not mandatory>\n" +
       "\t-baseDir <base DFS path. default is /benchmarks/NNBench. " +
@@ -197,6 +212,8 @@ public class NNBench extends Configured implements Tool {
       "\t-readFileAfterOpen <true or false. if true, it reads the file and " +
       "reports the average time to read. This is valid with the open_read " +
       "operation. default is false. This is not mandatory>\n" +
+      "\t-disableFsCache <true or false, if true, one FileSystem object per thread " +
+      "default is false. This is not mandatory>\n" +
       "\t-help: Display the help statement\n";
       
     
@@ -230,8 +247,8 @@ public class NNBench extends Configured implements Tool {
     
     // Parse command line args
     for (int i = 0; i < args.length; i++) {
-      if (args[i].equals("-operation")) {
-        operation = args[++i];
+      if (args[i].equals("-operations")) {
+        operations = args[++i];
       } else if (args[i].equals("-maps")) {
         checkArgs(i + 1, args.length);
         numberOfMaps = Long.parseLong(args[++i]);
@@ -253,6 +270,9 @@ public class NNBench extends Configured implements Tool {
       } else if (args[i].equals("-numberOfFiles")) {
         checkArgs(i + 1, args.length);
         numberOfFiles = Long.parseLong(args[++i]);
+      } else if (args[i].equals("-numberOfThreads")) {
+        checkArgs(i + 1, args.length);
+        numberOfThreads = Integer.parseInt(args[++i]);
       } else if (args[i].equals("-replicationFactorPerFile")) {
         checkArgs(i + 1, args.length);
         replicationFactorPerFile = Short.parseShort(args[++i]);
@@ -262,6 +282,9 @@ public class NNBench extends Configured implements Tool {
       } else if (args[i].equals("-readFileAfterOpen")) {
         checkArgs(i + 1, args.length);
         readFileAfterOpen = Boolean.parseBoolean(args[++i]);
+      } else if (args[i].equals("-disableFsCache")) {
+        checkArgs(i + 1, args.length);
+        disableFsCache = Boolean.parseBoolean(args[++i]);
       } else if (args[i].equals("-help")) {
         displayUsage();
         isHelpMessage = true;
@@ -269,7 +292,7 @@ public class NNBench extends Configured implements Tool {
     }
     
     LOG.info("Test Inputs: ");
-    LOG.info("           Test Operation: " + operation);
+    LOG.info("           Test Operation: " + operations);
     LOG.info("               Start time: " + sdf.format(new Date(startTime)));
     LOG.info("           Number of maps: " + numberOfMaps);
     LOG.info("        Number of reduces: " + numberOfReduces);
@@ -282,7 +305,7 @@ public class NNBench extends Configured implements Tool {
     LOG.info("     Read file after open: " + readFileAfterOpen);
     
     // Set user-defined parameters, so the map method can access the values
-    getConf().set("test.nnbench.operation", operation);
+    getConf().set("test.nnbench.operations", operations);
     getConf().setLong("test.nnbench.maps", numberOfMaps);
     getConf().setLong("test.nnbench.reduces", numberOfReduces);
     getConf().setLong("test.nnbench.starttime", startTime);
@@ -290,10 +313,12 @@ public class NNBench extends Configured implements Tool {
     getConf().setInt("test.nnbench.bytestowrite", bytesToWrite);
     getConf().setLong("test.nnbench.bytesperchecksum", bytesPerChecksum);
     getConf().setLong("test.nnbench.numberoffiles", numberOfFiles);
+    getConf().setInt("test.nnbench.numberofthreads", numberOfThreads);
     getConf().setInt("test.nnbench.replicationfactor",
             (int) replicationFactorPerFile);
     getConf().set("test.nnbench.basedir", baseDir);
     getConf().setBoolean("test.nnbench.readFileAfterOpen", readFileAfterOpen);
+    getConf().setBoolean("fs.hdfs.impl.disable.cache", disableFsCache);
 
     getConf().set("test.nnbench.datadir.name", DATA_DIR_NAME);
     getConf().set("test.nnbench.outputdir.name", OUTPUT_DIR_NAME);
@@ -377,6 +402,11 @@ public class NNBench extends Configured implements Tool {
     String resultALLine1 = null;
     String resultALLine2 = null;
 
+    String[] opArr = operations.split(",");
+    String operation = "none";
+    if (opArr.length == 1) {
+      operation = opArr[0];
+    }
     if (operation.equals(OP_CREATE_WRITE)) {
       // For create/write/close, it is treated as two transactions,
       // since a file create from a client perspective involves create and close
@@ -415,7 +445,7 @@ public class NNBench extends Configured implements Tool {
     "                           Date & time: " + sdf.format(new Date(
             System.currentTimeMillis())),
     "",
-    "                        Test Operation: " + operation,
+    "                        Test Operation: " + operations,
     "                            Start time: " + 
       sdf.format(new Date(startTime)),
     "                           Maps to run: " + numberOfMaps,
@@ -467,7 +497,8 @@ public class NNBench extends Configured implements Tool {
     
     JobConf job = new JobConf(getConf(), NNBench.class);
 
-    job.setJobName("NNBench-" + operation);
+    String[] operationArr = operations.split(",");
+    job.setJobName("NNBench-" + String.join("-", operationArr));
     FileInputFormat.setInputPaths(job, new Path(baseDir, CONTROL_DIR_NAME));
     job.setInputFormat(SequenceFileInputFormat.class);
     
@@ -492,14 +523,17 @@ public class NNBench extends Configured implements Tool {
    */
   private void validateInputs() {
     // If it is not one of the four operations, then fail
-    if (!operation.equals(OP_CREATE_WRITE) &&
-            !operation.equals(OP_OPEN_READ) &&
-            !operation.equals(OP_RENAME) &&
-            !operation.equals(OP_DELETE)) {
-      System.err.println("Error: Unknown operation: " + operation);
-      displayUsage();
-      throw new HadoopIllegalArgumentException(
-          "Error: Unknown operation: " + operation);
+    String[] opArr = operations.split(",");
+    for (String operation : opArr) {
+      if (!operation.equals(OP_CREATE_WRITE) &&
+          !operation.equals(OP_OPEN_READ) &&
+          !operation.equals(OP_RENAME) &&
+          !operation.equals(OP_DELETE)) {
+        System.err.println("Error: Unknown operation: " + operation);
+        displayUsage();
+        throw new HadoopIllegalArgumentException(
+            "Error: Unknown operation: " + operation);
+      }
     }
     
     // If number of maps is a negative number, then fail
@@ -621,8 +655,9 @@ public class NNBench extends Configured implements Tool {
     int bytesToWrite = 0;
     String baseDir = null;
     String dataDirName = null;
-    String op = null;
+    String ops = null;
     boolean readFile = false;
+    int numOfThreads = 0;
     
     // Data to collect from the operation
     int numOfExceptions = 0;
@@ -700,8 +735,9 @@ public class NNBench extends Configured implements Tool {
       bytesToWrite = conf.getInt("test.nnbench.bytestowrite", 0);
       baseDir = conf.get("test.nnbench.basedir");
       dataDirName = conf.get("test.nnbench.datadir.name");
-      op = conf.get("test.nnbench.operation");
+      ops = conf.get("test.nnbench.operations");
       readFile = conf.getBoolean("test.nnbench.readFileAfterOpen", false);
+      numOfThreads = conf.getInt("test.nnbench.numberofthreads", 1);
       
       long totalTimeTPmS = 0l;
       long startTimeTPmS = 0l;
@@ -714,27 +750,42 @@ public class NNBench extends Configured implements Tool {
       successfulFileOps = 0l;
       
       if (barrier()) {
-        String fileName = "file_" + value;
-        if (op.equals(OP_CREATE_WRITE)) {
-          startTimeTPmS = System.currentTimeMillis();
-          doCreateWriteOp(fileName, reporter);
-        } else if (op.equals(OP_OPEN_READ)) {
-          startTimeTPmS = System.currentTimeMillis();
-          doOpenReadOp(fileName, reporter);
-        } else if (op.equals(OP_RENAME)) {
-          startTimeTPmS = System.currentTimeMillis();
-          doRenameOp(fileName, reporter);
-        } else if (op.equals(OP_DELETE)) {
-          startTimeTPmS = System.currentTimeMillis();
-          doDeleteOp(fileName, reporter);
-        } else {
-          throw new IllegalArgumentException(
-              "unsupported operation [" + op + "]");
+        startTimeTPmS = System.currentTimeMillis();
+
+        List<Future> resultList = new ArrayList<>();
+        ExecutorService es = Executors.newFixedThreadPool(numOfThreads);
+        long numOfFilesPerThread = numberOfFiles / numOfThreads;
+        for (int i = 0; i < numOfThreads; ++i) {
+          Worker worker = new Worker(conf, value.get(), numOfFilesPerThread,
+              blkSize, replFactor, bytesToWrite, baseDir, dataDirName, ops, readFile,
+              numOfExceptions, reporter, i);
+          Future future = es.submit(worker);
+          resultList.add(future);
+        }
+
+        for (Future f : resultList) {
+          try {
+            Stats stats = (Stats)f.get();
+            if (stats != null) {
+              LOG.info("Worker-{} thread-{} successfully operate {} files, {} failed.",
+                  value.get(), resultList.indexOf(f),
+                  stats.successfulFileOps, stats.numOfExceptions);
+              totalTimeAL1 += stats.totalTimeAL1;
+              totalTimeAL2 += stats.totalTimeAL2;
+              numOfExceptions += stats.numOfExceptions;
+              successfulFileOps += stats.successfulFileOps;
+            }
+          } catch (InterruptedException e) {
+            LOG.warn("Future get: ", e);
+          } catch (ExecutionException e) {
+            LOG.warn("Future get: ", e);
+          }
         }
         
         endTimeTPms = System.currentTimeMillis();
         totalTimeTPmS = endTimeTPms - startTimeTPmS;
       } else {
+        LOG.info("Barrier return false, return immediately.");
         output.collect(new Text("l:latemaps"), new Text("1"));
       }
       
@@ -753,170 +804,270 @@ public class NNBench extends Configured implements Tool {
           new Text(String.valueOf(startTimeTPmS)));
       output.collect(new Text("max:mapEndTimeTPmS"), 
           new Text(String.valueOf(endTimeTPms)));
+      LOG.info("End mapper");
     }
-    
-    /**
-     * Create and Write operation.
-     * @param name of the prefix of the putput file to be created
-     * @param reporter an instanse of (@link Reporter) to be used for
-     *   status' updates
-     */
-    private void doCreateWriteOp(String name,
-                                 Reporter reporter) {
-      FSDataOutputStream out;
-      byte[] buffer = new byte[bytesToWrite];
-      
-      for (long l = 0l; l < numberOfFiles; l++) {
-        Path filePath = new Path(new Path(baseDir, dataDirName), 
-                name + "_" + l);
 
-        boolean successfulOp = false;
-        while (! successfulOp && numOfExceptions < MAX_OPERATION_EXCEPTIONS) {
-          try {
-            // Set up timer for measuring AL (transaction #1)
-            startTimeAL = System.currentTimeMillis();
-            // Create the file
-            // Use a buffer size of 512
-            out = filesystem.create(filePath, 
-                    true, 
-                    512, 
-                    replFactor, 
-                    blkSize);
-            out.write(buffer);
-            totalTimeAL1 += (System.currentTimeMillis() - startTimeAL);
+    class Stats {
+      long totalTimeAL1;
+      long totalTimeAL2;
+      long successfulFileOps;
+      long numOfExceptions;
 
-            // Close the file / file output stream
-            // Set up timers for measuring AL (transaction #2)
-            startTimeAL = System.currentTimeMillis();
-            out.close();
-            
-            totalTimeAL2 += (System.currentTimeMillis() - startTimeAL);
-            successfulOp = true;
-            successfulFileOps ++;
-
-            reporter.setStatus("Finish "+ l + " files");
-          } catch (IOException e) {
-            LOG.error("Exception recorded in op: Create/Write/Close, "
-                + "file: \"" + filePath + "\"", e);
-            numOfExceptions++;
-          }
-        }
+      public Stats(long totalTimeAL1, long totalTimeAL2,
+          long successfulFileOps, long numOfExceptions) {
+        this.totalTimeAL1 = totalTimeAL1;
+        this.totalTimeAL2 = totalTimeAL2;
+        this.successfulFileOps = successfulFileOps;
+        this.numOfExceptions = numOfExceptions;
       }
     }
-    
-    /**
-     * Open operation
-     * @param name of the prefix of the putput file to be read
-     * @param reporter an instanse of (@link Reporter) to be used for
-     *   status' updates
-     */
-    private void doOpenReadOp(String name,
-                              Reporter reporter) {
-      FSDataInputStream input;
-      byte[] buffer = new byte[bytesToWrite];
-      
-      for (long l = 0l; l < numberOfFiles; l++) {
-        Path filePath = new Path(new Path(baseDir, dataDirName), 
-                name + "_" + l);
 
-        boolean successfulOp = false;
-        while (! successfulOp && numOfExceptions < MAX_OPERATION_EXCEPTIONS) {
-          try {
-            // Set up timer for measuring AL
-            startTimeAL = System.currentTimeMillis();
-            input = filesystem.open(filePath);
-            totalTimeAL1 += (System.currentTimeMillis() - startTimeAL);
-            
-            // If the file needs to be read (specified at command line)
-            if (readFile) {
+    class Worker implements Callable<Stats> {
+      FileSystem filesystem = null;
+
+      String fileName;
+      long numberOfFiles = 1l;
+      long blkSize = 1l;
+      short replFactor = 1;
+      int bytesToWrite = 0;
+      String baseDir = null;
+      String dataDirName = null;
+      String ops = null;
+      boolean readFile = false;
+      Reporter reporter;
+      int index;
+
+      // Data to collect from the operation
+      int numOfExceptions = 0;
+      long startTimeAL = 0l;
+      long totalTimeAL1 = 0l;
+      long totalTimeAL2 = 0l;
+      long successfulFileOps = 0l;
+
+      public Worker(Configuration conf, long mapIndex, long nf, long blkSize,
+          short replFactor, int bytesToWrite, String baseDir, String dataDirName,
+          String ops, boolean readFile, int ne, Reporter reporter, int index) {
+        try {
+          filesystem = FileSystem.get(conf);
+        } catch(Exception e) {
+          throw new RuntimeException("Cannot get file system.", e);
+        }
+        this.fileName = "file" + "_m" + mapIndex + "_t" + index;
+        this.numberOfFiles = nf;
+        this.blkSize = blkSize;
+        this.replFactor = replFactor;
+        this.bytesToWrite = bytesToWrite;
+        this.baseDir = baseDir;
+        this.dataDirName = dataDirName + "_m" + mapIndex;
+        this.ops = ops;
+        this.readFile = readFile;
+        this.reporter = reporter;
+        this.numOfExceptions = ne;
+        this.index = index;
+      }
+
+      @Override
+      public Stats call() {
+        try {
+          String[] opsArr = null;
+          if (ops != null) {
+            opsArr = ops.split(",");
+          }
+          for (String op : opsArr) {
+            if (op.equals(OP_CREATE_WRITE)) {
+              doCreateWriteOp(fileName, reporter);
+            } else if (op.equals(OP_OPEN_READ)) {
+              doOpenReadOp(fileName, reporter);
+            } else if (op.equals(OP_RENAME)) {
+              doRenameOp(fileName, reporter);
+            } else if (op.equals(OP_DELETE)) {
+              doDeleteOp(fileName, reporter);
+            } else {
+              throw new IllegalArgumentException(
+                  "unsupported operation [" + op + "]");
+            }
+          }
+        } catch (IllegalArgumentException e) {
+          LOG.warn("In worker: ", e);
+          return null;
+        }
+        return new Stats(totalTimeAL1, totalTimeAL2, successfulFileOps, numOfExceptions);
+      }
+      /**
+       * Create and Write operation.
+       *
+       * @param name of the prefix of the putput file to be created
+       * @param reporter an instanse of (@link Reporter) to be used for status' updates
+       */
+      private void doCreateWriteOp(String name,
+          Reporter reporter) {
+        FSDataOutputStream out;
+        byte[] buffer = new byte[bytesToWrite];
+
+        for (long l = 0l; l < numberOfFiles; l++) {
+          Path filePath = new Path(new Path(baseDir, dataDirName),
+              name + "_" + l);
+
+          boolean successfulOp = false;
+          while (!successfulOp && numOfExceptions < MAX_OPERATION_EXCEPTIONS) {
+            try {
+              // Set up timer for measuring AL (transaction #1)
               startTimeAL = System.currentTimeMillis();
-              input.readFully(buffer);
+              // Create the file
+              // Use a buffer size of 512
+              out = filesystem.create(filePath,
+                  true,
+                  512,
+                  replFactor,
+                  blkSize);
+              out.write(buffer);
+              totalTimeAL1 += (System.currentTimeMillis() - startTimeAL);
+
+              // Close the file / file output stream
+              // Set up timers for measuring AL (transaction #2)
+              startTimeAL = System.currentTimeMillis();
+              out.close();
 
               totalTimeAL2 += (System.currentTimeMillis() - startTimeAL);
-            }
-            input.close();
-            successfulOp = true;
-            successfulFileOps ++;
+              successfulOp = true;
+              successfulFileOps++;
 
-            reporter.setStatus("Finish "+ l + " files");
-          } catch (IOException e) {
-            LOG.error("Exception recorded in op: OpenRead, " + "file: \""
-                + filePath + "\"", e);
-            numOfExceptions++;
+              reporter.setStatus("Finish " + l + " files");
+            } catch (IOException e) {
+              LOG.error("Exception recorded in op: Create/Write/Close, "
+                  + "file: \"" + filePath + "\"", e);
+              numOfExceptions++;
+            }
+          }
+          if (l > 0 && l % 100 == 0) {
+            LOG.info("Successfully create_write {}, failed {}", successfulFileOps, numOfExceptions);
           }
         }
       }
-    }
-    
-    /**
-     * Rename operation
-     * @param name of prefix of the file to be renamed
-     * @param reporter an instanse of (@link Reporter) to be used for
-     *   status' updates
-     */
-    private void doRenameOp(String name,
-                            Reporter reporter) {
-      for (long l = 0l; l < numberOfFiles; l++) {
-        Path filePath = new Path(new Path(baseDir, dataDirName), 
-                name + "_" + l);
-        Path filePathR = new Path(new Path(baseDir, dataDirName), 
-                name + "_r_" + l);
 
-        boolean successfulOp = false;
-        while (! successfulOp && numOfExceptions < MAX_OPERATION_EXCEPTIONS) {
-          try {
-            // Set up timer for measuring AL
-            startTimeAL = System.currentTimeMillis();
-            boolean result = filesystem.rename(filePath, filePathR);
-            if (!result) {
-              throw new IOException("rename failed for " + filePath);
+      /**
+       * Open operation
+       *
+       * @param name of the prefix of the putput file to be read
+       * @param reporter an instanse of (@link Reporter) to be used for status' updates
+       */
+      private void doOpenReadOp(String name,
+          Reporter reporter) {
+        FSDataInputStream input;
+        byte[] buffer = new byte[bytesToWrite];
+
+        for (long l = 0l; l < numberOfFiles; l++) {
+          Path filePath = new Path(new Path(baseDir, dataDirName),
+              name + "_" + l);
+
+          boolean successfulOp = false;
+          while (!successfulOp && numOfExceptions < MAX_OPERATION_EXCEPTIONS) {
+            try {
+              // Set up timer for measuring AL
+              startTimeAL = System.currentTimeMillis();
+              input = filesystem.open(filePath);
+              totalTimeAL1 += (System.currentTimeMillis() - startTimeAL);
+
+              // If the file needs to be read (specified at command line)
+              if (readFile) {
+                startTimeAL = System.currentTimeMillis();
+                input.readFully(buffer);
+
+                totalTimeAL2 += (System.currentTimeMillis() - startTimeAL);
+              }
+              input.close();
+              successfulOp = true;
+              successfulFileOps++;
+
+              reporter.setStatus("Finish " + l + " files");
+            } catch (IOException e) {
+              LOG.error("Exception recorded in op: OpenRead, " + "file: \""
+                  + filePath + "\"", e);
+              numOfExceptions++;
             }
-            totalTimeAL1 += (System.currentTimeMillis() - startTimeAL);
-            
-            successfulOp = true;
-            successfulFileOps ++;
-
-            reporter.setStatus("Finish "+ l + " files");
-          } catch (IOException e) {
-            LOG.error("Exception recorded in op: Rename, " + "file: \""
-                + filePath + "\"", e);
-            numOfExceptions++;
+          }
+          if (l > 0 && l % 100 == 0) {
+            LOG.info("Successfully open_read {}, failed {}", successfulFileOps, numOfExceptions);
           }
         }
       }
-    }
-    
-    /**
-     * Delete operation
-     * @param name of prefix of the file to be deleted
-     * @param reporter an instanse of (@link Reporter) to be used for
-     *   status' updates
-     */
-    private void doDeleteOp(String name,
-                            Reporter reporter) {
-      for (long l = 0l; l < numberOfFiles; l++) {
-        Path filePath = new Path(new Path(baseDir, dataDirName), 
-                name + "_" + l);
-        
-        boolean successfulOp = false;
-        while (! successfulOp && numOfExceptions < MAX_OPERATION_EXCEPTIONS) {
-          try {
-            // Set up timer for measuring AL
-            startTimeAL = System.currentTimeMillis();
-            boolean result = filesystem.delete(filePath, true);
-            if (!result) {
-              throw new IOException("delete failed for " + filePath);
-            }
-            totalTimeAL1 += (System.currentTimeMillis() - startTimeAL);
-            
-            successfulOp = true;
-            successfulFileOps ++;
 
-            reporter.setStatus("Finish "+ l + " files");
-          } catch (IOException e) {
-            LOG.error("Exception recorded in op: Delete, " + "file: \""
-                + filePath + "\"", e);
-            numOfExceptions++;
+      /**
+       * Rename operation
+       *
+       * @param name of prefix of the file to be renamed
+       * @param reporter an instanse of (@link Reporter) to be used for status' updates
+       */
+      private void doRenameOp(String name,
+          Reporter reporter) {
+        for (long l = 0l; l < numberOfFiles; l++) {
+          Path filePath = new Path(new Path(baseDir, dataDirName),
+              name + "_" + l);
+          Path filePathR = new Path(new Path(baseDir, dataDirName),
+              name + "_r_" + l);
+
+          boolean successfulOp = false;
+          while (!successfulOp && numOfExceptions < MAX_OPERATION_EXCEPTIONS) {
+            try {
+              // Set up timer for measuring AL
+              startTimeAL = System.currentTimeMillis();
+              boolean result = filesystem.rename(filePath, filePathR);
+              if (!result) {
+                throw new IOException("rename failed for " + filePath);
+              }
+              totalTimeAL1 += (System.currentTimeMillis() - startTimeAL);
+
+              successfulOp = true;
+              successfulFileOps++;
+
+              reporter.setStatus("Finish " + l + " files");
+            } catch (IOException e) {
+              LOG.error("Exception recorded in op: Rename, " + "file: \""
+                  + filePath + "\"", e);
+              numOfExceptions++;
+            }
+          }
+          if (l > 0 && l % 100 == 0) {
+            LOG.info("Successfully rename {}, failed {}", successfulFileOps, numOfExceptions);
+          }
+        }
+      }
+
+      /**
+       * Delete operation
+       *
+       * @param name of prefix of the file to be deleted
+       * @param reporter an instanse of (@link Reporter) to be used for status' updates
+       */
+      private void doDeleteOp(String name,
+          Reporter reporter) {
+        for (long l = 0l; l < numberOfFiles; l++) {
+          Path filePath = new Path(new Path(baseDir, dataDirName),
+              name + "_" + l);
+
+          boolean successfulOp = false;
+          while (!successfulOp && numOfExceptions < MAX_OPERATION_EXCEPTIONS) {
+            try {
+              // Set up timer for measuring AL
+              startTimeAL = System.currentTimeMillis();
+              boolean result = filesystem.delete(filePath, true);
+              if (!result) {
+                throw new IOException("delete failed for " + filePath);
+              }
+              totalTimeAL1 += (System.currentTimeMillis() - startTimeAL);
+
+              successfulOp = true;
+              successfulFileOps++;
+
+              reporter.setStatus("Finish " + l + " files");
+            } catch (IOException e) {
+              LOG.error("Exception recorded in op: Delete, " + "file: \""
+                  + filePath + "\"", e);
+              numOfExceptions++;
+            }
+          }
+          if (l > 0 && l % 100 == 0) {
+            LOG.info("Successfully delete {}, failed {}", successfulFileOps, numOfExceptions);
           }
         }
       }
